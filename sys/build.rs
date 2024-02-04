@@ -41,6 +41,10 @@ fn main() {
     }
     #[cfg(feature = "cuda")]
     {
+        println!("cargo:rustc-link-lib=cuda");
+        // println!("cargo:rustc-link-lib=cublas_static");
+        // println!("cargo:rustc-link-lib=cudart_static");
+        // println!("cargo:rustc-link-lib=cublasLt_static");
         println!("cargo:rustc-link-lib=cublas");
         println!("cargo:rustc-link-lib=cudart");
         println!("cargo:rustc-link-lib=cublasLt");

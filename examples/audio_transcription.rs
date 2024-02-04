@@ -8,34 +8,51 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 /// Loads a context and model, processes an audio file, and prints the resulting transcript to stdout.
 fn main() -> Result<(), &'static str> {
+    let model_path = std::env::args().nth(1).expect("model_path");
+    let wav_path = std::env::args().nth(2).expect("wav_path");
+    let tm = std::time::Instant::now();
     // Load a context and model.
+    let mut params = WhisperContextParameters::default();
+    params.use_gpu = true;
     let ctx = WhisperContext::new_with_params(
-        "example/path/to/model/whisper.cpp/models/ggml-base.en.bin",
-        WhisperContextParameters::default(),
+        // "/home/sliu/test/whisper-rs/models/ggml-large.bin",
+        &model_path,
+        // "/home/sliu/test/whisper-rs/models/ggml-tiny.bin",
+        // WhisperContextParameters::default(),
+        params,
     )
     .expect("failed to load model");
     // Create a state
     let mut state = ctx.create_state().expect("failed to create key");
 
+    println!("model loaded, elapsed:{}s", tm.elapsed().as_secs_f32());
     // Create a params object for running the model.
     // The number of past samples to consider defaults to 0.
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
+    // let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
     // Edit params as needed.
     // Set the number of threads to use to 1.
-    params.set_n_threads(1);
+    // params.set_n_threads(1);
     // Enable translation.
-    params.set_translate(true);
+    // params.set_translate(true);
     // Set the language to translate to to English.
-    params.set_language(Some("en"));
+    // params.set_language(Some("en"));
     // Disable anything that prints to stdout.
-    params.set_print_special(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_print_timestamps(false);
+    // params.set_print_special(false);
+    // params.set_print_progress(false);
+    // params.set_print_realtime(false);
+    // params.set_print_timestamps(false);
+    // params.set_tdrz_enable(true);
+    // params.set_language(None);
+    // params.set_detect_language(true);
+    // params.set_suppress_non_speech_tokens(true);
+    params.set_initial_prompt("请输出简体中文");
 
+    let tm = std::time::Instant::now();
     // Open the audio file.
-    let mut reader = hound::WavReader::open("audio.wav").expect("failed to open file");
+    let mut reader = hound::WavReader::open(&wav_path).expect("failed to open file");
+    // let mut reader = hound::WavReader::open("1m.wav").expect("failed to open file");
     #[allow(unused_variables)]
     let hound::WavSpec {
         channels,
@@ -64,13 +81,20 @@ fn main() -> Result<(), &'static str> {
     if sample_rate != 16000 {
         panic!("sample rate must be 16KHz");
     }
+    println!(
+        "audio process finished, elapsed:{}s",
+        tm.elapsed().as_secs_f32()
+    );
 
+    let tm = std::time::Instant::now();
     // Run the model.
     state.full(params, &audio[..]).expect("failed to run model");
+    println!("asr finished, elapsed:{}s", tm.elapsed().as_secs_f32());
 
     // Create a file to write the transcript to.
     let mut file = File::create("transcript.txt").expect("failed to create file");
 
+    println!("start predict");
     // Iterate through the segments of the transcript.
     let num_segments = state
         .full_n_segments()
