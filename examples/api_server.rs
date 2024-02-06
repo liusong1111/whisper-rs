@@ -34,7 +34,11 @@ pub struct Args {
     /// whether use gpu
     #[arg(short = 'g', long, env, default_value_t = true)]
     pub use_gpu: bool,
-    #[arg(long, env, default_value = "请输出简体中文，并带上合适的中文标点符号")]
+    #[arg(
+        long,
+        env,
+        default_value = "这是学校里一节课的录音，说话的人可能是老师也可能是学生，他们说的是中文。请转写成文本，输出的文本必须是简体中文，只有十分必要时才允许包含英文。要求在合适位置插入标点符号。每句话的最后必须加上标点符号，如句号、叹号等。"
+    )]
     pub cn_prompt: Option<String>,
     /// if the model is idle(no request incoming), after n secs, the model will be destroyed(unloaded) to free GPU memory
     #[arg(long, env, default_value_t = 30)]
