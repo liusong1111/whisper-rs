@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, sync::Arc};
 
 use async_channel::Sender;
 use axum::{
@@ -6,16 +6,17 @@ use axum::{
     extract::Multipart,
     http::{HeaderMap, StatusCode},
     response::Response,
-    routing::post,
+    routing::{any, post},
     Extension, Router,
 };
 use clap::Parser;
 use nanoid::nanoid;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use serde_with::skip_serializing_none;
 use snafu::prelude::*;
-use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio::{net::TcpListener, time::timeout};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, error};
 use tracing_subscriber::EnvFilter;
@@ -30,14 +31,14 @@ pub struct Args {
     pub port: u16,
     #[arg(short, long, env, default_value = "/models/ggml-large.bin")]
     pub model: String,
-    /// the number of model will be created and work paralleling
-    #[arg(short, long, env, default_value_t = 1)]
-    pub num_threads: usize,
     /// whether use gpu
     #[arg(short = 'g', long, env, default_value_t = true)]
     pub use_gpu: bool,
-    #[arg(long, env, default_value = "请输出简体中文")]
+    #[arg(long, env, default_value = "请输出简体中文，并带上合适的中文标点符号")]
     pub cn_prompt: Option<String>,
+    /// if the model is idle(no request incoming), after n secs, the model will be destroyed(unloaded) to free GPU memory
+    #[arg(long, env, default_value_t = 30)]
+    pub destroy_model_after_idle_in_secs: u64,
 }
 
 #[skip_serializing_none]
@@ -94,6 +95,8 @@ pub struct AsrRawWord {
 pub enum AsrError {
     #[snafu(display("bad request error"))]
     BadRequestError,
+    #[snafu(display("loadModelError"))]
+    LoadModelError { source: WhisperError },
     #[snafu(display("read audio error"))]
     ReadAudioError { source: hound::Error },
     #[snafu(display("wav spec error, should match `-c 1 -ar 16000`, got {current_spec}"))]
@@ -108,6 +111,8 @@ pub enum AsrError {
     SendError,
     #[snafu(display("recv response error"))]
     RecvError,
+    #[snafu(display("join error"))]
+    JoinError { source: tokio::task::JoinError },
 }
 
 impl From<AsrError> for AsrResponse {
@@ -120,15 +125,24 @@ impl From<AsrError> for AsrResponse {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AsrContext {
-    pub ctx: WhisperContext,
+    pub ctx: Arc<WhisperContext>,
 }
 
 impl AsrContext {
     pub fn new(ctx: WhisperContext) -> Self {
-        Self { ctx }
+        Self { ctx: Arc::new(ctx) }
     }
+
+    pub async fn predict_async(&self, req: AsrRequest) -> Result<AsrResponse, AsrError> {
+        let me = self.clone();
+        let ret = tokio::task::spawn_blocking(move || me.predict(req))
+            .await
+            .context(JoinSnafu)??;
+        Ok(ret)
+    }
+
     pub fn predict(&self, req: AsrRequest) -> Result<AsrResponse, AsrError> {
         let AsrRequest {
             data,
@@ -138,7 +152,7 @@ impl AsrContext {
             prompt,
         } = req;
         let request_id = request_id.unwrap_or_else(|| nanoid!(6));
-        let lang = lang.unwrap_or_else(|| "cn".to_string());
+        // let lang = lang.unwrap_or_else(|| "cn".to_string());
 
         let data = std::io::Cursor::new(data);
         let mut reader = hound::WavReader::new(data).context(ReadAudioSnafu)?;
@@ -187,7 +201,7 @@ impl AsrContext {
         // Create a state
         let mut state = self.ctx.create_state().context(CreateStateSnafu)?;
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_language(None);
+        // params.set_language(None);
         if let Some(prompt) = prompt {
             params.set_initial_prompt(&prompt);
         }
@@ -243,47 +257,116 @@ impl AsrContext {
     }
 }
 
+#[derive(Debug)]
+pub enum AsrContextMessage {
+    AsrRequest {
+        request: AsrRequest,
+        ack: oneshot::Sender<AsrResponse>,
+    },
+    UnloadModel {
+        ack: oneshot::Sender<()>,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct AsrContextCli {
-    pub n: usize,
-    pub tx: Sender<(AsrRequest, oneshot::Sender<AsrResponse>)>,
+    pub tx: Sender<AsrContextMessage>,
 }
 
 impl AsrContextCli {
     pub fn new_from_args(args: Args) -> Self {
-        let n = args.num_threads;
+        let (tx, rx) = async_channel::bounded::<AsrContextMessage>(1);
 
-        let (tx, rx) = async_channel::bounded::<(AsrRequest, oneshot::Sender<AsrResponse>)>(n + 1);
-        let mut ctxs = vec![];
-        for _i in 0..n {
-            let mut params = WhisperContextParameters::default();
-            params.use_gpu = args.use_gpu;
-            let ctx = WhisperContext::new_with_params(&args.model, params).unwrap_or_else(|err| {
-                panic!(
-                    "failed to load model: {}, use_gpu={}, err={}",
-                    args.model, args.use_gpu, err
-                )
-            });
-            ctxs.push(ctx);
-        }
-        for ctx in ctxs {
-            let rx = rx.clone();
-            tokio::task::spawn_blocking(move || {
-                let ctx = AsrContext::new(ctx);
-                while let Ok((req, ack)) = rx.recv_blocking() {
-                    let response = ctx.predict(req).unwrap_or_else(|err| err.into());
-                    if let Err(_err) = ack.send(response) {
-                        error!("ack send error");
+        tokio::spawn(async move {
+            let mut ctx_box = None;
+            loop {
+                let m = timeout(
+                    std::time::Duration::from_secs(args.destroy_model_after_idle_in_secs),
+                    rx.recv(),
+                );
+                match m.await {
+                    Ok(Ok(message)) => match message {
+                        AsrContextMessage::AsrRequest { request, ack } => {
+                            if ctx_box.is_none() {
+                                let mut params = WhisperContextParameters::default();
+                                params.use_gpu = args.use_gpu;
+                                let ctx = WhisperContext::new_with_params(&args.model, params)
+                                    .context(LoadModelSnafu);
+                                let ctx = match ctx {
+                                    Ok(it) => it,
+                                    Err(err) => {
+                                        error!(%err, "load model error");
+                                        let response = err.into();
+                                        if let Err(_err) = ack.send(response) {
+                                            error!("ack send error");
+                                        }
+                                        continue;
+                                    }
+                                };
+                                let ctx = AsrContext::new(ctx);
+                                let _ = ctx_box.insert(ctx);
+                            }
+                            let Some(ctx) = ctx_box.as_mut() else {
+                                error!("should never be here!");
+                                continue;
+                            };
+                            let response = ctx
+                                .predict_async(request)
+                                .await
+                                .unwrap_or_else(|err| err.into());
+                            if let Err(_err) = ack.send(response) {
+                                error!("ack send error");
+                            }
+                        }
+                        AsrContextMessage::UnloadModel { ack } => {
+                            if let Some(ctx) = ctx_box.take() {
+                                drop(ctx);
+                            }
+                            let _ = ack.send(());
+                        }
+                    },
+                    Ok(Err(_err)) => {
+                        error!("channel is closed, will quit!");
+                        if let Some(ctx) = ctx_box.take() {
+                            drop(ctx);
+                        }
+                        return;
+                    }
+                    Err(_) => {
+                        // destroy model on idle
+                        if let Some(ctx) = ctx_box.take() {
+                            drop(ctx);
+                        }
                     }
                 }
-            });
-        }
-        Self { n, tx }
+            }
+        });
+
+        Self { tx }
     }
 
     pub async fn predict(&self, req: AsrRequest) -> Result<AsrResponse, AsrError> {
         let (ack_tx, ack_rx) = oneshot::channel();
-        if let Err(_err) = self.tx.send((req, ack_tx)).await {
+        let message = AsrContextMessage::AsrRequest {
+            request: req,
+            ack: ack_tx,
+        };
+        if let Err(_err) = self.tx.send(message).await {
+            return Err(AsrError::SendError);
+        }
+        let response = match ack_rx.await {
+            Ok(it) => it,
+            Err(_err) => {
+                return Err(AsrError::RecvError);
+            }
+        };
+        Ok(response)
+    }
+
+    pub async fn unload_model(&self) -> Result<(), AsrError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let message = AsrContextMessage::UnloadModel { ack: ack_tx };
+        if let Err(_err) = self.tx.send(message).await {
             return Err(AsrError::SendError);
         }
         let response = match ack_rx.await {
@@ -300,7 +383,9 @@ pub async fn start_http_server(args: Args) {
     let asr_context_cli = AsrContextCli::new_from_args(args.clone());
 
     let api_router = Router::new();
-    let api_router = api_router.route("/asr", post(asr_handler));
+    let api_router = api_router
+        .route("/asr", post(asr_handler))
+        .route("/destroy", any(destroy_handler));
     let app = Router::new();
     let app = app.nest("/api", api_router);
     let app = app
@@ -341,6 +426,9 @@ pub async fn asr_handler(
             let Ok(lang) = lang else {
                 continue;
             };
+            if lang.is_empty() {
+                continue;
+            }
             f_lang = Some(lang);
             continue;
         }
@@ -409,6 +497,28 @@ pub async fn asr_handler(
     };
     let response = asr_context_cli.predict(req).await;
     let response = response.unwrap_or_else(|err| err.into());
+    Response::builder()
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&response).unwrap()))
+        .unwrap()
+}
+
+pub async fn destroy_handler(Extension(asr_context_cli): Extension<AsrContextCli>) -> Response {
+    let response = asr_context_cli.unload_model().await;
+    let response = match response {
+        Ok(_) => {
+            json!({
+                "code": 0,
+                "message": "unload model succeeded",
+            })
+        }
+        Err(err) => {
+            json!({
+                "code": 500,
+                "message": format!("unload model failed, error={err}"),
+            })
+        }
+    };
     Response::builder()
         .header("Content-Type", "application/json")
         .body(Body::from(serde_json::to_string(&response).unwrap()))
