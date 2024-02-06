@@ -18,7 +18,7 @@ use snafu::prelude::*;
 use tokio::sync::oneshot;
 use tokio::{net::TcpListener, time::timeout};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperError,
@@ -66,6 +66,8 @@ pub struct AsrResponse {
     pub mixed_read_time: Vec<(f64, f64)>,
     #[serde(default)]
     pub mixed_ans_time: Vec<(f64, f64)>,
+
+    pub delta: f32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -246,10 +248,12 @@ impl AsrContext {
         let texts: Vec<_> = sentences.iter().map(|it| it.text.clone()).collect();
         let text = texts.join(" ");
 
+        let delta = tm.elapsed().as_secs_f32();
         let r#final = AsrRawFinal { text, sentences };
         let response = AsrResponse {
             code: 0,
             r#final: Some(r#final),
+            delta,
             ..Default::default()
         };
 
@@ -492,14 +496,17 @@ pub async fn asr_handler(
         data: f_file_content,
         lang: f_lang,
         filename: Some(f_file_name),
-        request_id: Some(request_id),
+        request_id: Some(request_id.clone()),
         prompt: f_prompt,
     };
+
     let response = asr_context_cli.predict(req).await;
     let response = response.unwrap_or_else(|err| err.into());
+    let response = serde_json::to_string(&response).unwrap();
+    info!(%request_id, %response);
     Response::builder()
         .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_string(&response).unwrap()))
+        .body(Body::from(response))
         .unwrap()
 }
 
