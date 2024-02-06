@@ -1,19 +1,27 @@
+use std::env;
+
 use async_channel::Sender;
 use axum::{
-    extract::{Multipart, State},
-    http::{response, Response, StatusCode, HeaderMap},
+    body::Body,
+    extract::Multipart,
+    http::{HeaderMap, StatusCode},
+    response::Response,
     routing::post,
-    Json, Router, response::Response,
+    Extension, Router,
 };
 use clap::Parser;
 use nanoid::nanoid;
+use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use snafu::prelude::*;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use tracing::error;
-use whisper_rs::{WhisperContext, WhisperError};
+use tracing::{debug, error};
+use tracing_subscriber::EnvFilter;
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperError,
+};
 
 #[derive(Debug, Clone, Parser)]
 #[command(version, about)]
@@ -24,7 +32,7 @@ pub struct Args {
     pub model: String,
     /// the number of model will be created and work paralleling
     #[arg(short, long, env, default_value_t = 1)]
-    pub num_threads: String,
+    pub num_threads: usize,
     /// whether use gpu
     #[arg(short = 'g', long, env, default_value_t = true)]
     pub use_gpu: bool,
@@ -38,6 +46,7 @@ pub struct AsrRequest {
     pub data: Vec<u8>,
     // cn, en, ...
     pub lang: Option<String>,
+    pub prompt: Option<String>,
     pub filename: Option<String>,
     pub request_id: Option<String>,
 }
@@ -83,10 +92,14 @@ pub struct AsrRawWord {
 
 #[derive(Debug, Snafu)]
 pub enum AsrError {
+    #[snafu(display("bad request error"))]
+    BadRequestError,
     #[snafu(display("read audio error"))]
     ReadAudioError { source: hound::Error },
     #[snafu(display("wav spec error, should match `-c 1 -ar 16000`, got {current_spec}"))]
     WavSpecError { current_spec: String },
+    #[snafu(display("create state error"))]
+    CreateStateError { source: WhisperError },
     #[snafu(display("predict error"))]
     PredictError { source: WhisperError },
     #[snafu(display("get segment error"))]
@@ -122,9 +135,12 @@ impl AsrContext {
             lang,
             filename,
             request_id,
+            prompt,
         } = req;
         let request_id = request_id.unwrap_or_else(|| nanoid!(6));
+        let lang = lang.unwrap_or_else(|| "cn".to_string());
 
+        let data = std::io::Cursor::new(data);
         let mut reader = hound::WavReader::new(data).context(ReadAudioSnafu)?;
 
         #[allow(unused_variables)]
@@ -141,7 +157,7 @@ impl AsrContext {
         }
 
         // Convert the audio to floating point samples.
-        let mut audio = whisper_rs::convert_integer_to_float_audio(
+        let audio = whisper_rs::convert_integer_to_float_audio(
             &reader
                 .samples::<i16>()
                 .map(|s| s.unwrap_or_default())
@@ -168,6 +184,14 @@ impl AsrContext {
 
         let tm = std::time::Instant::now();
         // Run the model.
+        // Create a state
+        let mut state = self.ctx.create_state().context(CreateStateSnafu)?;
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_language(None);
+        if let Some(prompt) = prompt {
+            params.set_initial_prompt(&prompt);
+        }
+
         debug!(%request_id, "asr begin");
         state.full(params, &audio[..]).context(PredictSnafu)?;
         let delta = tm.elapsed().as_secs_f32();
@@ -180,7 +204,7 @@ impl AsrContext {
         let num_segments = state
             .full_n_segments()
             .expect("failed to get number of segments");
-        let sentences = vec![];
+        let mut sentences = vec![];
         for i in 0..num_segments {
             // Get the transcribed text and timestamps for the current segment.
             let segment = state.full_get_segment_text(i).context(GetSegmentSnafu)?;
@@ -207,10 +231,10 @@ impl AsrContext {
         let texts: Vec<_> = sentences.iter().map(|it| it.text.clone()).collect();
         let text = texts.join("\n");
 
-        let final = AsrRawFinal{ text, sentences };
+        let r#final = AsrRawFinal { text, sentences };
         let response = AsrResponse {
             code: 0,
-            final: Some(final),
+            r#final: Some(r#final),
             ..Default::default()
         };
 
@@ -228,15 +252,15 @@ impl AsrContextCli {
     pub fn new_from_args(args: Args) -> Self {
         let n = args.num_threads;
 
-        let (tx, rx) = async_channel::bounded(n + 1);
+        let (tx, rx) = async_channel::bounded::<(AsrRequest, oneshot::Sender<AsrResponse>)>(n + 1);
         let mut ctxs = vec![];
-        for i in 0..n {
+        for _i in 0..n {
             let mut params = WhisperContextParameters::default();
             params.use_gpu = args.use_gpu;
             let ctx = WhisperContext::new_with_params(&args.model, params).unwrap_or_else(|err| {
                 panic!(
-                    "failed to load model: {}, use_gpu={}",
-                    args.model, args.use_gpu
+                    "failed to load model: {}, use_gpu={}, err={}",
+                    args.model, args.use_gpu, err
                 )
             });
             ctxs.push(ctx);
@@ -247,7 +271,9 @@ impl AsrContextCli {
                 let ctx = AsrContext::new(ctx);
                 while let Ok((req, ack)) = rx.recv_blocking() {
                     let response = ctx.predict(req).unwrap_or_else(|err| err.into());
-                    ack.send(response);
+                    if let Err(_err) = ack.send(response) {
+                        error!("ack send error");
+                    }
                 }
             });
         }
@@ -256,12 +282,12 @@ impl AsrContextCli {
 
     pub async fn predict(&self, req: AsrRequest) -> Result<AsrResponse, AsrError> {
         let (ack_tx, ack_rx) = oneshot::channel();
-        if let Err(err) = self.tx.send((req, ack_tx)).await {
+        if let Err(_err) = self.tx.send((req, ack_tx)).await {
             return Err(AsrError::SendError);
         }
         let response = match ack_rx.await {
             Ok(it) => it,
-            Err(err) => {
+            Err(_err) => {
                 return Err(AsrError::RecvError);
             }
         };
@@ -279,7 +305,8 @@ pub async fn start_http_server(args: Args) {
     let app = app
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
-        .with_state(asr_context_cli);
+        .layer(Extension(asr_context_cli))
+        .layer(Extension(args.clone()));
 
     let addr = format!("0.0.0.0:{}", args.port);
     let listener = TcpListener::bind(&addr)
@@ -289,21 +316,23 @@ pub async fn start_http_server(args: Args) {
 }
 
 pub async fn asr_handler(
-    mut multipart: Multipart,
+    Extension(asr_context_cli): Extension<AsrContextCli>,
+    Extension(args): Extension<Args>,
     headers: HeaderMap,
-    State(asr_context_cli): State<AsrContextCli>,
-) -> Response<Json<AsrResponse>> {
+    mut multipart: Multipart,
+) -> Response {
     let mut f_file_name = None;
     let mut f_file_content = None;
     let mut f_lang = Some("cn".to_string());
-    let field_names = vec!["data", "lang"];
+    let mut f_prompt = None;
+    let field_names = vec!["data", "lang", "prompt"];
     while let Ok(Some(field)) = multipart.next_field().await {
         let field_name = field.name().map(ToOwned::to_owned);
         let file_name = field.file_name().map(ToOwned::to_owned);
         let Some(field_name) = field_name else {
             continue;
         };
-        if !field_names.contains(field_name) {
+        if !field_names.contains(&field_name.as_str()) {
             continue;
         }
         if field_name == "lang" {
@@ -312,6 +341,14 @@ pub async fn asr_handler(
                 continue;
             };
             f_lang = Some(lang);
+            continue;
+        }
+        if field_name == "prompt" {
+            let prompt = field.text().await;
+            let Ok(prompt) = prompt else {
+                continue;
+            };
+            f_prompt = Some(prompt);
             continue;
         }
         // 生成唯一文件名
@@ -342,16 +379,50 @@ pub async fn asr_handler(
         f_file_content = Some(content);
     }
     let (Some(f_file_name), Some(f_file_content)) = (f_file_name, f_file_content) else {
-        return Response::builder().status(StatusCode::BAD_REQUEST);
+        let response = AsrResponse {
+            code: 400,
+            message: Some(format!("Bad Request")),
+            ..Default::default()
+        };
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from(serde_json::to_string(&response).unwrap()))
+            .unwrap();
     };
-    let request_id = headers.get("x-request-id").and_then(|it| it.to_str().ok()).map(ToOwned::to_owned).unwrap_or_else(|| nanoid!(6));
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|it| it.to_str().ok())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| nanoid!(6));
+
+    if f_prompt.is_none() && f_lang == Some("cn".to_string()) {
+        f_prompt = args.cn_prompt.clone();
+    }
+
     let req = AsrRequest {
         data: f_file_content,
         lang: f_lang,
         filename: Some(f_file_name),
         request_id: Some(request_id),
+        prompt: f_prompt,
     };
     let response = asr_context_cli.predict(req).await;
     let response = response.unwrap_or_else(|err| err.into());
-    Response::builder().body(Json(response))
+    Response::builder()
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&response).unwrap()))
+        .unwrap()
+}
+
+#[tokio::main]
+async fn main() {
+    if env::var("RUST_LOG").is_err() {
+        env::set_var("RUST_LOG", "debug");
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
+    let args = Args::parse();
+    debug!(?args);
+    start_http_server(args).await;
 }
