@@ -208,6 +208,7 @@ impl AsrContext {
         for i in 0..num_segments {
             // Get the transcribed text and timestamps for the current segment.
             let segment = state.full_get_segment_text(i).context(GetSegmentSnafu)?;
+            let segment = segment.trim().to_string();
             let start_timestamp = state.full_get_segment_t0(i).context(GetSegmentSnafu)?;
             let end_timestamp = state.full_get_segment_t1(i).context(GetSegmentSnafu)?;
             let sentence = AsrRawSentence {
@@ -229,7 +230,7 @@ impl AsrContext {
             //     .expect("failed to write to file");
         }
         let texts: Vec<_> = sentences.iter().map(|it| it.text.clone()).collect();
-        let text = texts.join("\n");
+        let text = texts.join(" ");
 
         let r#final = AsrRawFinal { text, sentences };
         let response = AsrResponse {
