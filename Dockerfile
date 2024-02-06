@@ -92,4 +92,5 @@ ENV LD_LIBRARY_PATH /usr/local/cuda-${CUDA_MAIN_VERSION}/compat:$LD_LIBRARY_PATH
 
 COPY --from=build /app /app
 
-ENTRYPOINT [ "bash", "-c" ]
+# ENTRYPOINT [ "bash", "-c" ]
+CMD /app/target/release/examples/api_serer
