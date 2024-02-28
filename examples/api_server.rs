@@ -206,7 +206,8 @@ impl AsrContext {
         // Run the model.
         // Create a state
         let mut state = self.ctx.create_state().context(CreateStateSnafu)?;
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 2 });
+        params.set_suppress_non_speech_tokens(true);
         // params.set_language(None);
         if let Some(prompt) = prompt {
             params.set_initial_prompt(&prompt);
