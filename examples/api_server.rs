@@ -3,7 +3,7 @@ use std::{env, sync::Arc};
 use async_channel::Sender;
 use axum::{
     body::Body,
-    extract::Multipart,
+    extract::{DefaultBodyLimit, Multipart},
     http::{HeaderMap, StatusCode},
     response::Response,
     routing::{any, post},
@@ -400,6 +400,8 @@ pub async fn start_http_server(args: Args) {
     let app = app
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
+        // max body size = 1G
+        .layer(DefaultBodyLimit::max(1 * 1024 * 1024 * 1024))
         .layer(Extension(asr_context_cli))
         .layer(Extension(args.clone()));
 
@@ -423,7 +425,6 @@ pub async fn asr_handler(
     let field_names = vec!["data", "lang", "prompt"];
     while let Ok(Some(field)) = multipart.next_field().await {
         let field_name = field.name().map(ToOwned::to_owned);
-        let file_name = field.file_name().map(ToOwned::to_owned);
         let Some(field_name) = field_name else {
             continue;
         };
@@ -451,7 +452,9 @@ pub async fn asr_handler(
         }
         // 生成唯一文件名
         let r = nanoid!(6);
-        let file_name = file_name.unwrap_or("a".to_string());
+        // let file_name = field.file_name().map(ToOwned::to_owned);
+        // let file_name = file_name.unwrap_or("a.wav".to_string());
+        let file_name = "a.wav".to_string();
         let file_name = sanitize_filename::sanitize(&file_name);
         let p = std::path::Path::new(&file_name);
         let file_stem = p
@@ -461,7 +464,7 @@ pub async fn asr_handler(
         let file_ext = p
             .extension()
             .map(|it| it.to_string_lossy().to_string())
-            .unwrap_or("docx".to_string());
+            .unwrap_or("wav".to_string());
         let file_name = format!("{file_stem}_{r}.{file_ext}");
         f_file_name = Some(file_name);
 
