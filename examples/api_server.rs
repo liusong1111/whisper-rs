@@ -14,6 +14,7 @@ use nanoid::nanoid;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_with::skip_serializing_none;
+use smart_default::SmartDefault;
 use snafu::prelude::*;
 use tokio::sync::oneshot;
 use tokio::{net::TcpListener, time::timeout};
@@ -54,6 +55,41 @@ pub struct AsrRequest {
     pub prompt: Option<String>,
     pub filename: Option<String>,
     pub request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, SmartDefault, PartialEq, Eq)]
+pub enum AsrLang {
+    En,
+    #[default]
+    Cn,
+}
+
+impl AsrLang {
+    pub fn from_string(lang: Option<String>) -> Self {
+        let ret = match lang {
+            None => AsrLang::default(),
+            Some(lang) => match lang
+                .to_lowercase()
+                .replace("-", "")
+                .replace("_", "")
+                .as_str()
+            {
+                "cn" | "zh" | "zhcn" | "cnzh" => AsrLang::Cn,
+                "en" => AsrLang::En,
+                _ => {
+                    warn!(%lang, "unknown lang");
+                    AsrLang::default()
+                }
+            },
+        };
+        ret
+    }
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            AsrLang::En => "en",
+            AsrLang::Cn => "zh-CN",
+        }
+    }
 }
 
 #[skip_serializing_none]
@@ -213,28 +249,32 @@ impl AsrContext {
         });
 
         params.set_suppress_non_speech_tokens(true);
-        match lang {
-            None => {
-                params.set_language(None);
-            }
-            Some(lang) => match lang.replace("-", "").to_lowercase().as_str() {
-                "cn" | "zh" | "zhcn" | "cnzh" => {
-                    params.set_language(Some("zh-CN"));
-                }
-                "en" => {
-                    params.set_language(Some("en"));
-                }
-                lang => {
-                    warn!(%lang, "unknown asr lang");
-                    params.set_language(None);
-                }
-            },
-        }
+        let lang = AsrLang::from_string(lang);
+        let lang = lang.to_str();
+        let lang = Some(lang);
+        params.set_language(lang);
+        // match lang {
+        //     None => {
+        //         params.set_language(None);
+        //     }
+        //     Some(lang) => match lang.replace("-", "").to_lowercase().as_str() {
+        //         "cn" | "zh" | "zhcn" | "cnzh" => {
+        //             params.set_language(Some("zh-CN"));
+        //         }
+        //         "en" => {
+        //             params.set_language(Some("en"));
+        //         }
+        //         lang => {
+        //             warn!(%lang, "unknown asr lang");
+        //             params.set_language(None);
+        //         }
+        //     },
+        // }
         if let Some(prompt) = &prompt {
             params.set_initial_prompt(&prompt);
         }
 
-        debug!(%request_id, ?prompt, "asr begin");
+        debug!(%request_id, ?lang, ?prompt, "asr begin");
         state.full(params, &audio[..]).context(PredictSnafu)?;
         let delta = tm.elapsed().as_secs_f32();
         debug!(%request_id, "asr finished, elapsed:{}s", delta);
@@ -517,13 +557,14 @@ pub async fn asr_handler(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| nanoid!(6));
 
-    if f_prompt.is_none() && f_lang == Some("cn".to_string()) {
+    let lang = AsrLang::from_string(f_lang.clone());
+    if lang == AsrLang::Cn {
         f_prompt = args.cn_prompt.clone();
     }
 
     let req = AsrRequest {
         data: f_file_content,
-        lang: f_lang,
+        lang: Some(lang.to_str().to_string()),
         filename: Some(f_file_name),
         request_id: Some(request_id.clone()),
         prompt: f_prompt,
