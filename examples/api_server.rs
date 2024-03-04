@@ -18,7 +18,7 @@ use snafu::prelude::*;
 use tokio::sync::oneshot;
 use tokio::{net::TcpListener, time::timeout};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperError,
@@ -206,9 +206,25 @@ impl AsrContext {
         // Run the model.
         // Create a state
         let mut state = self.ctx.create_state().context(CreateStateSnafu)?;
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 2 });
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_suppress_non_speech_tokens(true);
-        // params.set_language(None);
+        match lang {
+            None => {
+                params.set_language(None);
+            }
+            Some(lang) => match lang.as_str() {
+                "cn" => {
+                    params.set_language(Some("cn"));
+                }
+                "en" => {
+                    params.set_language(Some("en"));
+                }
+                lang => {
+                    warn!(%lang, "unknown asr lang");
+                    params.set_language(None);
+                }
+            },
+        }
         if let Some(prompt) = &prompt {
             params.set_initial_prompt(&prompt);
         }
