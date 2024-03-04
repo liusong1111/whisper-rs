@@ -89,6 +89,7 @@ RUN cargo install gitui
 # Ref: https://stackoverflow.com/a/53464012
 ENV CUDA_MAIN_VERSION=11.7
 ENV LD_LIBRARY_PATH /usr/local/cuda-${CUDA_MAIN_VERSION}/compat:$LD_LIBRARY_PATH
+ENV CUDA_MODULE_LOADING=LAZY
 
 COPY --from=build /app /app
 
