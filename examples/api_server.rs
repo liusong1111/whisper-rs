@@ -209,11 +209,11 @@ impl AsrContext {
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 2 });
         params.set_suppress_non_speech_tokens(true);
         // params.set_language(None);
-        if let Some(prompt) = prompt {
+        if let Some(prompt) = &prompt {
             params.set_initial_prompt(&prompt);
         }
 
-        debug!(%request_id, "asr begin");
+        debug!(%request_id, ?prompt, "asr begin");
         state.full(params, &audio[..]).context(PredictSnafu)?;
         let delta = tm.elapsed().as_secs_f32();
         debug!(%request_id, "asr finished, elapsed:{}s", delta);
