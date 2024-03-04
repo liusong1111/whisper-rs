@@ -37,7 +37,7 @@ pub struct Args {
     #[arg(
         long,
         env,
-        default_value = "这是学校里一节课的录音，说话的人可能是老师也可能是学生，他们说的是中文。请转写成文本，输出的文本必须是简体中文，只有十分必要时才允许包含英文。要求在合适位置插入标点符号。每句话的最后必须加上标点符号，如句号、叹号等。"
+        default_value = "这是学校里一节课的录音，说话的人可能是老师也可能是学生，他们说的是汉语。请转写成文本，输出的文本必须是简体中文，不能出现英文，也不能出现繁体字。要求在合适位置插入标点符号。每句话和每个segment的结尾必须加上标点符号，如逗号（，）句号（。）叹号（！）问号（？）顿号（、）等。"
     )]
     pub cn_prompt: Option<String>,
     /// if the model is idle(no request incoming), after n secs, the model will be destroyed(unloaded) to free GPU memory
