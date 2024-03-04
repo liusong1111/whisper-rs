@@ -87,7 +87,7 @@ impl AsrLang {
     pub fn to_str(&self) -> &'static str {
         match self {
             AsrLang::En => "en",
-            AsrLang::Cn => "zh-CN",
+            AsrLang::Cn => "zh",
         }
     }
 }
@@ -253,23 +253,6 @@ impl AsrContext {
         let lang = lang.to_str();
         let lang = Some(lang);
         params.set_language(lang);
-        // match lang {
-        //     None => {
-        //         params.set_language(None);
-        //     }
-        //     Some(lang) => match lang.replace("-", "").to_lowercase().as_str() {
-        //         "cn" | "zh" | "zhcn" | "cnzh" => {
-        //             params.set_language(Some("zh-CN"));
-        //         }
-        //         "en" => {
-        //             params.set_language(Some("en"));
-        //         }
-        //         lang => {
-        //             warn!(%lang, "unknown asr lang");
-        //             params.set_language(None);
-        //         }
-        //     },
-        // }
         if let Some(prompt) = &prompt {
             params.set_initial_prompt(&prompt);
         }
