@@ -206,15 +206,20 @@ impl AsrContext {
         // Run the model.
         // Create a state
         let mut state = self.ctx.create_state().context(CreateStateSnafu)?;
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        // let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        let mut params = FullParams::new(SamplingStrategy::BeamSearch {
+            beam_size: 5,
+            patience: 1.0,
+        });
+
         params.set_suppress_non_speech_tokens(true);
         match lang {
             None => {
                 params.set_language(None);
             }
-            Some(lang) => match lang.as_str() {
-                "cn" => {
-                    params.set_language(Some("cn"));
+            Some(lang) => match lang.replace("-", "").to_lowercase().as_str() {
+                "cn" | "zh" | "zhcn" | "cnzh" => {
+                    params.set_language(Some("zh-CN"));
                 }
                 "en" => {
                     params.set_language(Some("en"));
